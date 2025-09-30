@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+instaloader==4.11
+requests
