@@ -165,3 +165,4 @@ def profile_pic(username: str):
         pass
 
     raise HTTPException(status_code=404, detail="not found")
+
