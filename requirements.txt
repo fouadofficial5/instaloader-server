@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
 requests
-instaloader
-pydantic
+instaloader==4.11
+firebase-admin
+google-cloud-firestore
