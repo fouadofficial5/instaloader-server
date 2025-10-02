@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests, re, html, time
+import os
 
 # instaloader اختياري (نستخدمه فقط إن توفر)
 try:
@@ -23,6 +24,20 @@ try:
         ),
     )
     HAS_INSTALOADER = True
+
+# ===== تحميل جلسة إنستغرام من ملف (أفضل من الباسورد) =====
+IG_SESSION_FILE = os.environ.get("IG_SESSION_FILE") or os.environ.get("SESSION_FILE")
+
+IG_SESSION_LOADED = False
+if HAS_INSTALOADER and IG_SESSION_FILE:
+    try:
+        # يدعم مسار مطلق مثل: /etc/secrets/session-test_user1999999999
+        L.load_session_from_file(None, IG_SESSION_FILE)
+        IG_SESSION_LOADED = True
+        print(f"[IG] Session loaded from {IG_SESSION_FILE}")
+    except Exception as e:
+        print(f"[IG] Failed to load session from file: {e}")
+        
 except Exception:
     L = None
     HAS_INSTALOADER = False
@@ -424,15 +439,29 @@ def verify_follow(
     if not source or not target or len(source) > 30 or len(target) > 30:
         return {"follows": False, "reason": "invalid"}
 
-    if not _ensure_login():
-        return {"follows": False, "reason": "login_failed"}
+    def _ensure_login():
+    """
+    يضمن أن L مسجّل دخول. يجرّب أولاً ملف الجلسة إن وُجد،
+    وإن لم ينجح يجرب IG_LOGIN/IG_PASSWORD من المتغيرات.
+    """
+    global L, HAS_INSTALOADER, IG_SESSION_LOADED
+    if not HAS_INSTALOADER:
+        return False
 
-    try:
-        # نحمل متابَعات المصدر ونبحث عن الهدف
-        src = instaloader.Profile.from_username(L.context, source)
-        for f in src.get_followees():
-            if f.username.lower() == target:
-                return {"follows": True, "reason": "ok"}
-        return {"follows": False, "reason": "not_following"}
-    except Exception as e:
-        return {"follows": False, "reason": "error"}
+    # لو الجلسة مُحمّلة مسبقًا نعتبره Logged-in
+    if IG_SESSION_LOADED:
+        return True
+
+    # محاولة لاحقة بالباسورد (احتياطي فقط)
+    ig_user = os.getenv("IG_LOGIN")
+    ig_pass = os.getenv("IG_PASSWORD")
+    if ig_user and ig_pass:
+        try:
+            L.login(ig_user, ig_pass)
+            # لو نجح سجّل Session بالذاكرة فقط
+            IG_SESSION_LOADED = True
+            return True
+        except Exception as e:
+            print("Instaloader login failed:", e)
+
+    return False
