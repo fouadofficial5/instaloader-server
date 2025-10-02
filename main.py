@@ -203,3 +203,194 @@ def profile_pic_dash(username: str):
     if not url:
         raise HTTPException(status_code=404, detail="not found")
     return PicResp(url=url)
+
+# ====== NEW: تحقق المتابعة + منح العملات عبر Firebase ======
+import os, json
+from pydantic import BaseModel
+from typing import Optional
+
+# Firebase Admin
+FIREBASE_INITIALIZED = False
+db_admin = None
+
+def _init_firebase_once():
+    global FIREBASE_INITIALIZED, db_admin
+    if FIREBASE_INITIALIZED:
+        return
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        # نقرأ JSON لمفاتيح الخدمة من متغير بيئة FIREBASE_CREDENTIALS_JSON
+        creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
+        if not creds_json:
+            raise RuntimeError("FIREBASE_CREDENTIALS_JSON env not set")
+        cred = firebase_admin.credentials.Certificate(json.loads(creds_json))
+        firebase_admin.initialize_app(cred)
+        db_admin = firestore.client()
+        FIREBASE_INITIALIZED = True
+    except Exception as e:
+        print("Firebase init failed:", e)
+        raise
+
+# تسجيل الدخول لـ Instaloader (حساب checker) مرة واحدة
+IG_LOGGED_IN = False
+def _ensure_ig_login():
+    global IG_LOGGED_IN
+    if IG_LOGGED_IN or not HAS_INSTALOADER:
+        return
+    ig_user = os.environ.get("IG_CHECKER_USER", "")
+    ig_pass = os.environ.get("IG_CHECKER_PASS", "")
+    if not ig_user or not ig_pass:
+        # لو ما في حساب checker، هنكمل بالـ scraping (أقل دقة)
+        return
+    try:
+        L.login(ig_user, ig_pass)
+        IG_LOGGED_IN = True
+    except Exception as e:
+        print("Instaloader login failed:", e)
+
+class VerifyReq(BaseModel):
+    taskId: str
+    claimant: str   # الذي يدعي أنه تابع
+    target: str     # المطلوب متابعته (صاحب المهمة)
+
+class VerifyResp(BaseModel):
+    ok: bool
+    reason: Optional[str] = None
+    newCoins: Optional[int] = None    # رصيد المُطالب بعد المكافأة، إن وُجد
+
+def _user_follows_target(claimant: str, target: str) -> bool:
+    """
+    يرجع True فقط إذا تأكدنا أن claimant يتابع target.
+    نفضّل استخدام instaloader مع تسجيل دخول checker (أدق)،
+    وإلا نسقط على Scrape (أضعف وقد يفشل مع الحسابات الخاصة).
+    """
+    claimant = _normalize(claimant)
+    target = _normalize(target)
+
+    # A) الأفضل: Instaloader مع تسجيل دخول
+    if HAS_INSTALOADER:
+        _ensure_ig_login()
+        try:
+            target_prof = instaloader.Profile.from_username(L.context, target)
+            # تحذير: استعراض كل المتابعين قد يكون بطيء؛ نحده بعدد معقول
+            # نبحث بالاسم مباشرة (case-insensitive)
+            limit = int(os.environ.get("IG_FOLLOWERS_SCAN_LIMIT", "1000"))
+            count = 0
+            for follower in target_prof.get_followers():
+                if follower.username.lower() == claimant:
+                    return True
+                count += 1
+                if count >= limit:
+                    break
+        except Exception as e:
+            print("Instaloader check failed:", e)
+
+    # B) fallback ضعيف: لا يوجد طريقة موثوقة بدون تسجيل دخول
+    # هنرجع False لتجنّب الغش (أو يمكنك إرجاع None ويعني "غير قادر على التحقق")
+    return False
+
+def _award_and_close_task(db, task_id: str, claimant: str, reward_coins: int = 10) -> int:
+    """
+    يُضيف عملات للمطالب claimant إن لم يكن أخذها من قبل لهذه المهمة،
+    ويحدّث progress للمهمة/الطلب.
+    يرجع الرصيد الجديد للمطالب بعد الإضافة.
+    """
+    import google.cloud.firestore
+    from google.cloud.firestore_v1 import Transaction
+
+    claimant = _normalize(claimant)
+
+    @google.cloud.firestore.transactional
+    def _tx(transaction: Transaction):
+        task_ref = db.collection("followTasks").document(task_id)
+        task_snap = task_ref.get(transaction=transaction)
+        if not task_snap.exists:
+            raise RuntimeError("TASK_NOT_FOUND")
+
+        active = task_snap.get("active") is True
+        need   = int(task_snap.get("need") or 0)
+        done   = int(task_snap.get("doneCount") or 0)
+        order_id = task_snap.get("orderId") or ""
+        target_user = task_snap.get("targetUsername") or ""
+        if not active:
+            raise RuntimeError("TASK_NOT_ACTIVE")
+
+        # participants/<claimant>
+        part_ref = task_ref.collection("participants").document(claimant)
+        part_snap = part_ref.get(transaction=transaction)
+        if not part_snap.exists:
+            # لازم يكون طالب “Start” من قبل (claimFollowStart) — لو حاب تتساهل احذف هذا الشرط
+            raise RuntimeError("NO_PARTICIPATION")
+
+        if part_snap.get("followed") is True:
+            # سبق وأخذها
+            user_ref = db.collection("users").document(claimant)
+            user_snap = user_ref.get(transaction=transaction)
+            return int(user_snap.get("coins") or 0)
+
+        # علّم أنه اتبع
+        transaction.update(part_ref, {
+            "followed": True,
+            "confirmedAt": google.cloud.firestore.SERVER_TIMESTAMP
+        })
+
+        # زد العداد
+        new_done = done + 1
+        transaction.update(task_ref, {"doneCount": new_done})
+
+        # حدّث الطلب
+        if order_id and target_user:
+            order_ref = db.collection("users").document(target_user).collection("orders").document(order_id)
+            transaction.update(order_ref, {"doneCount": new_done})
+            if new_done >= need:
+                transaction.update(task_ref, {"active": False})
+                transaction.update(order_ref, {"status": "DONE"})
+
+        # أضف مكافأة العملات للمُطالب
+        user_ref = db.collection("users").document(claimant)
+        user_snap = user_ref.get(transaction=transaction)
+        if not user_snap.exists:
+            transaction.set(user_ref, {
+                "username": claimant,
+                "coins": reward_coins,
+                "createdAt": int(time.time() * 1000),
+                "profilePicUrl": ""
+            })
+            return reward_coins
+        else:
+            cur = int(user_snap.get("coins") or 0)
+            newv = cur + reward_coins
+            transaction.update(user_ref, {"coins": newv, "username": claimant})
+            return newv
+
+    tx = db.transaction()
+    new_coins = _tx(tx)
+    return new_coins
+
+@app.post("/verify/and_award", response_model=VerifyResp)
+def verify_and_award(req: VerifyReq):
+    """
+    يتأكد إذا claimant يتابع target.
+    - إن تأكدنا: نُحدّث Firestore (participants/task/order) ونمنح claimant 10 عملات.
+    - إن لم نتأكد: نرجع ok=false.
+    """
+    _init_firebase_once()
+
+    claimant = _normalize(req.claimant)
+    target   = _normalize(req.target)
+    if not claimant or not target or not req.taskId:
+        return VerifyResp(ok=False, reason="bad_request")
+
+    # التحقق
+    followed = _user_follows_target(claimant, target)
+    if not followed:
+        return VerifyResp(ok=False, reason="not_following")
+
+    # منح العملات وتحديث المهمة
+    try:
+        new_coins = _award_and_close_task(db_admin, req.taskId, claimant, reward_coins=int(os.environ.get("FOLLOW_REWARD_COINS","10")))
+        return VerifyResp(ok=True, newCoins=new_coins)
+    except Exception as e:
+        print("award failed:", e)
+        return VerifyResp(ok=False, reason="award_failed")
