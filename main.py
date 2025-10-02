@@ -394,3 +394,45 @@ def verify_and_award(req: VerifyReq):
     except Exception as e:
         print("award failed:", e)
         return VerifyResp(ok=False, reason="award_failed")
+
+# ===== تحقق متابعة: هل source يتابع target؟ =====
+from fastapi import Query
+import os
+
+IG_LOGIN = os.getenv("IG_LOGIN")       # موجودة عندك في Render
+IG_PASSWORD = os.getenv("IG_PASSWORD") # موجودة عندك في Render
+
+def _ensure_login():
+    global L, HAS_INSTALOADER
+    if not HAS_INSTALOADER:
+        return False
+    try:
+        if not getattr(L.context, "_logged_in", False):
+            L.login(IG_LOGIN, IG_PASSWORD)
+            L.context._logged_in = True
+        return True
+    except Exception:
+        return False
+
+@app.get("/verify_follow")
+def verify_follow(
+    source: str = Query(..., description="username العامل"),
+    target: str = Query(..., description="username الهدف")
+):
+    source = _normalize(source)
+    target = _normalize(target)
+    if not source or not target or len(source) > 30 or len(target) > 30:
+        return {"follows": False, "reason": "invalid"}
+
+    if not _ensure_login():
+        return {"follows": False, "reason": "login_failed"}
+
+    try:
+        # نحمل متابَعات المصدر ونبحث عن الهدف
+        src = instaloader.Profile.from_username(L.context, source)
+        for f in src.get_followees():
+            if f.username.lower() == target:
+                return {"follows": True, "reason": "ok"}
+        return {"follows": False, "reason": "not_following"}
+    except Exception as e:
+        return {"follows": False, "reason": "error"}
