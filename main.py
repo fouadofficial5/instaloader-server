@@ -90,7 +90,7 @@ def root():
 def health():
     return {"ok": True}
 
-# 1) التحقق من وجود اسم المستخدم
+# 1) التحقق من وجود اسم المستخدم (أكثر دقة)
 @app.get("/username/{username}/exists", response_model=ExistsResp)
 def username_exists(username: str):
     username = _normalize(username)
@@ -102,41 +102,66 @@ def username_exists(username: str):
     if cached is not None:
         return cached
 
-    # محاولة 1: طلب GET إلى صفحة انستغرام
     try:
         r = requests.get(
-            f"https://www.instagram.com/{username}/",
+            f"https://www.instagram.com/{username}/?hl=en",
             headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
             timeout=12,
         )
-        if r.status_code in (200, 301, 302):
-            data = ExistsResp(exists=True, reason="ok")
-            _cache_set(cache_key, data)
-            return data
-        if r.status_code == 404:
+        html_text = r.text or ""
+        code = r.status_code
+
+        # 404 = غير موجود بصراحة
+        if code == 404:
             data = ExistsResp(exists=False, reason="not_found")
-            _cache_set(cache_key, data)
-            return data
-        if r.status_code in (403, 429):
-            data = ExistsResp(exists=True, reason="rate_limited")
-            _cache_set(cache_key, data)
-            return data
+            _cache_set(cache_key, data); return data
+
+        # 200 أحيانًا يرجّع صفحة خطأ مع نص "Page Not Found"
+        not_found_markers = (
+            "page not found",
+            "the link you followed may be broken",
+            "sorry, this page isn't available"
+        )
+        if code == 200:
+            if any(m in html_text.lower() for m in not_found_markers):
+                data = ExistsResp(exists=False, reason="not_found")
+                _cache_set(cache_key, data); return data
+
+            # علامات صفحة بروفايل حقيقية
+            profile_markers = (
+                '"profile_pic_url"', '"profile_pic_url_hd"',
+                'profilePage_', '"is_private"', '"edge_followed_by"'
+            )
+            if any(m in html_text for m in profile_markers):
+                data = ExistsResp(exists=True, reason="ok")
+                _cache_set(cache_key, data); return data
+
+        # 403 / 429 أو 200 بدون مؤشرات واضحة -> جرّب instaloader
+        if HAS_INSTALOADER:
+            try:
+                instaloader.Profile.from_username(L.context, username)
+                data = ExistsResp(exists=True, reason="ok")
+                _cache_set(cache_key, data); return data
+            except Exception:
+                # لو فشل instaloader نرجّح غير موجود
+                data = ExistsResp(exists=False, reason="not_found")
+                _cache_set(cache_key, data); return data
+
+        # إن لم نحسم النتيجة
+        reason = "rate_limited" if code in (403, 429) else "error"
+        data = ExistsResp(exists=False, reason=reason)
+        _cache_set(cache_key, data); return data
+
     except Exception:
-        pass
-
-    if HAS_INSTALOADER:
-        try:
-            instaloader.Profile.from_username(L.context, username)
-            data = ExistsResp(exists=True, reason="ok")
-            _cache_set(cache_key, data)
-            return data
-        except Exception:
-            data = ExistsResp(exists=False, reason="error")
-            _cache_set(cache_key, data)
-            return data
-
-    return ExistsResp(exists=False, reason="error")
-
+        # كحل أخير: حاول instaloader، وإلا خطأ
+        if HAS_INSTALOADER:
+            try:
+                instaloader.Profile.from_username(L.context, username)
+                data = ExistsResp(exists=True, reason="ok")
+                _cache_set(cache_key, data); return data
+            except Exception:
+                pass
+        return ExistsResp(exists=False, reason="error")
 # 2) رابط صورة البروفايل
 def _get_profile_pic(username: str) -> str | None:
     username = _normalize(username)
@@ -279,3 +304,4 @@ def verify_follow(source: str = Query(...), target: str = Query(...)):
         return {"follows": False, "reason": "not_following"}
     except Exception:
         return {"follows": False, "reason": "error"}
+
