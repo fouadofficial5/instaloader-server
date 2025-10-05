@@ -129,62 +129,46 @@ def username_exists(username: str):
         return ExistsResp(exists=False, reason="error")
 
     cache_key = f"exists:{username}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+    c = _cache_get(cache_key)
+    if c is not None:
+        return c
 
+    # أولاَ: instaloader بجلسة تسجيل الدخول (أدق، ويتجاوز حجب/Rate limit)
+    if HAS_INSTALOADER and _ensure_login():
+        try:
+            instaloader.Profile.from_username(L.context, username)
+            data = ExistsResp(exists=True, reason="ok")
+            _cache_set(cache_key, data); return data
+        except Exception:
+            pass  # نكمل على HTTP
+
+    # ثانياً: HTTP fallback
     try:
         r = requests.get(
             f"https://www.instagram.com/{username}/?hl=en",
             headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=12,
-            allow_redirects=True,
+            timeout=12, allow_redirects=True
         )
         html_text = r.text or ""
-        code = r.status_code
+        if r.status_code == 404:
+            data = ExistsResp(exists=False, reason="not_found")
+            _cache_set(cache_key, data); return data
 
-        # 404 = غير موجود
-        if code == 404:
-            data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
+        if r.status_code == 200:
+            nf = ["page not found","the link you followed may be broken","sorry, this page isn't available"]
+            if any(t in html_text.lower() for t in nf):
+                data = ExistsResp(exists=False, reason="not_found")
+                _cache_set(cache_key, data); return data
+            prof_markers = ['"profile_pic_url"','"profile_pic_url_hd"','profilePage_','"is_private"','"edge_followed_by"']
+            if any(m in html_text for m in prof_markers):
+                data = ExistsResp(exists=True, reason="ok")
+                _cache_set(cache_key, data); return data
 
-        # 200: نتأكد أنها صفحة بروفايل وليست صفحة "غير موجود"
-        if code == 200:
-            not_found_markers = (
-                "page not found",
-                "the link you followed may be broken",
-                "sorry, this page isn't available",
-            )
-            if any(m in html_text.lower() for m in not_found_markers):
-                data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
-
-            profile_markers = (
-                '"profile_pic_url"', '"profile_pic_url_hd"',
-                'profilePage_', '"is_private"', '"edge_followed_by"'
-            )
-            if any(m in html_text for m in profile_markers):
-                data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
-
-        # 403/429 أو 200 غامضة → جرّب instaloader
-        if HAS_INSTALOADER and _ensure_login():
-            try:
-                instaloader.Profile.from_username(L.context, username)
-                data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
-            except Exception:
-                data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
-
-        reason = "rate_limited" if code in (403, 429) else "error"
-        data = ExistsResp(exists=False, reason=reason); _cache_set(cache_key, data); return data
-
+        # 403/429 وغيره = احتمال حجب
+        data = ExistsResp(exists=False, reason="rate_limited" if r.status_code in (403,429) else "error")
+        _cache_set(cache_key, data); return data
     except Exception:
-        # آخر محاولة: instaloader
-        if HAS_INSTALOADER and _ensure_login():
-            try:
-                instaloader.Profile.from_username(L.context, username)
-                data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
-            except Exception:
-                pass
         return ExistsResp(exists=False, reason="error")
-
 # ===== 2) رابط صورة البروفايل =====
 def _get_profile_pic(username: str) -> str | None:
     username = _normalize(username)
@@ -280,3 +264,4 @@ def _init_firebase_once():
     except Exception as e:
         print("Firebase init failed:", e)
         raise
+
