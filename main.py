@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# FastAPI + (requests + instaloader كـ fallback): سرفر بسيط للتحقق وجلب صورة البروفايل
+# FastAPI + (requests + instaloader كـ fallback): سرفر للتحقق وجلب صورة البروفايل
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import requests, re, html, time, os, json
 from typing import Optional
 
-# instaloader اختياري (نستخدمه فقط إن توفر)
+# ================== Instaloader ==================
 try:
     import instaloader
     L = instaloader.Instaloader(
@@ -18,19 +18,54 @@ try:
         post_metadata_txt_pattern="",
         compress_json=False,
         max_connection_attempts=1,
-        user_agent=(
-            "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-        ),
+        user_agent=("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"),
     )
     HAS_INSTALOADER = True
 except Exception:
     L = None
     HAS_INSTALOADER = False
 
-app = FastAPI(title="Instaloader mini server", version="1.1")
+# ------ تحميل الجلسة من Secret File (أفضل) ------
+IG_SESSION_FILE = os.environ.get("IG_SESSION_FILE") or os.environ.get("SESSION_FILE")
+IG_SESSION_LOADED = False
+if HAS_INSTALOADER and IG_SESSION_FILE:
+    try:
+        L.load_session_from_file(None, IG_SESSION_FILE)
+        IG_SESSION_LOADED = True
+        print(f"[IG] Session loaded from {IG_SESSION_FILE}")
+    except Exception as e:
+        print(f"[IG] Failed to load session from file: {e}")
 
-# ===== CORS للسماح للتطبيق بالوصول =====
+# ------ احتياطي: اسم/كلمة مرور من Environment ------
+IG_LOGIN = os.getenv("IG_LOGIN")
+IG_PASSWORD = os.getenv("IG_PASSWORD")
+
+def _ensure_login() -> bool:
+    """
+    يضمن أن Instaloader مسجّل دخول:
+    - يعتمد أولاً على الجلسة المحمّلة.
+    - إن لم تتوفر، يحاول IG_LOGIN/IG_PASSWORD.
+    """
+    global IG_SESSION_LOADED, L, HAS_INSTALOADER
+    if not HAS_INSTALOADER:
+        return False
+    if IG_SESSION_LOADED:
+        return True
+    if IG_LOGIN and IG_PASSWORD:
+        try:
+            L.login(IG_LOGIN, IG_PASSWORD)
+            IG_SESSION_LOADED = True
+            print("[IG] Logged in with username/password fallback")
+            return True
+        except Exception as e:
+            print("Fallback IG login failed:", e)
+    return False
+# ===================================================
+
+app = FastAPI(title="Instaloader mini server", version="1.3")
+
+# ===== CORS =====
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,11 +74,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== Helpers =====
-UA = (
-    "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
 
 def _normalize(u: str) -> str:
     return u.strip().lstrip("@").replace(" ", "").lower()
@@ -72,16 +104,15 @@ class ExistsResp(BaseModel):
 class PicResp(BaseModel):
     url: str
 
-# ===== مسارات =====
+# ===== مسارات عامة =====
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "message": "FastAPI Instagram helper",
         "endpoints": {
-            "health": "/health",
             "exists": "/username/{username}/exists",
             "profile_pic": "/username/{username}/profile_pic",
+            "verify_follow": "/verify_follow?source=..&target=..",
             "docs": "/docs",
         },
     }
@@ -90,7 +121,7 @@ def root():
 def health():
     return {"ok": True}
 
-# 1) التحقق من وجود اسم المستخدم (أكثر دقة)
+# ===== 1) التحقق من وجود اسم المستخدم (دقيق) =====
 @app.get("/username/{username}/exists", response_model=ExistsResp)
 def username_exists(username: str):
     username = _normalize(username)
@@ -112,34 +143,49 @@ def username_exists(username: str):
         html_text = r.text or ""
         code = r.status_code
 
+        # 404 = غير موجود
         if code == 404:
             data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
 
+        # 200: نتأكد أنها صفحة بروفايل وليست صفحة "غير موجود"
         if code == 200:
-            if any(m in html_text.lower() for m in ["page not found","the link you followed may be broken","sorry, this page isn't available"]):
+            not_found_markers = (
+                "page not found",
+                "the link you followed may be broken",
+                "sorry, this page isn't available",
+            )
+            if any(m in html_text.lower() for m in not_found_markers):
                 data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
-            if any(m in html_text for m in ['"profile_pic_url"','"profile_pic_url_hd"','profilePage_','"is_private"','"edge_followed_by"']):
+
+            profile_markers = (
+                '"profile_pic_url"', '"profile_pic_url_hd"',
+                'profilePage_', '"is_private"', '"edge_followed_by"'
+            )
+            if any(m in html_text for m in profile_markers):
                 data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
 
-        # 403/429 → جرّب instaloader
-        if HAS_INSTALOADER:
+        # 403/429 أو 200 غامضة → جرّب instaloader
+        if HAS_INSTALOADER and _ensure_login():
             try:
                 instaloader.Profile.from_username(L.context, username)
                 data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
             except Exception:
                 data = ExistsResp(exists=False, reason="not_found"); _cache_set(cache_key, data); return data
 
-        reason = "rate_limited" if code in (403,429) else "error"
+        reason = "rate_limited" if code in (403, 429) else "error"
         data = ExistsResp(exists=False, reason=reason); _cache_set(cache_key, data); return data
 
     except Exception:
-        if HAS_INSTALOADER:
+        # آخر محاولة: instaloader
+        if HAS_INSTALOADER and _ensure_login():
             try:
                 instaloader.Profile.from_username(L.context, username)
                 data = ExistsResp(exists=True, reason="ok"); _cache_set(cache_key, data); return data
-            except Exception: pass
+            except Exception:
+                pass
         return ExistsResp(exists=False, reason="error")
-# 2) رابط صورة البروفايل
+
+# ===== 2) رابط صورة البروفايل =====
 def _get_profile_pic(username: str) -> str | None:
     username = _normalize(username)
     if not username or len(username) > 30:
@@ -150,17 +196,18 @@ def _get_profile_pic(username: str) -> str | None:
     if cached is not None:
         return cached.url if isinstance(cached, PicResp) else cached
 
-    if HAS_INSTALOADER:
+    # أ) instaloader (أدق)
+    if HAS_INSTALOADER and _ensure_login():
         try:
             profile = instaloader.Profile.from_username(L.context, username)
             url = str(profile.profile_pic_url)
             if url:
-                data = PicResp(url=url)
-                _cache_set(cache_key, data)
+                _cache_set(cache_key, PicResp(url=url))
                 return url
-        except Exception:
-            pass
+        except Exception as e:
+            print("Instaloader profile_pic failed:", e)
 
+    # ب) HTML fallback
     try:
         r = requests.get(
             f"https://www.instagram.com/{username}/",
@@ -168,20 +215,16 @@ def _get_profile_pic(username: str) -> str | None:
             timeout=12,
         )
         html_text = r.text or ""
-        m = re.search(r'"profile_pic_url_hd"\s*:\s*"([^"]+)"', html_text)
-        if m:
-            url = html.unescape(m.group(1)).replace("\\u0026", "&").replace("\\/", "/")
-            data = PicResp(url=url)
-            _cache_set(cache_key, data)
-            return url
-        m2 = re.search(r'"profile_pic_url"\s*:\s*"([^"]+)"', html_text)
-        if m2:
-            url = html.unescape(m2.group(1)).replace("\\u0026", "&").replace("\\/", "/")
-            data = PicResp(url=url)
-            _cache_set(cache_key, data)
-            return url
-    except Exception:
-        pass
+        for pat in (r'"profile_pic_url_hd"\s*:\s*"([^"]+)"',
+                    r'"profile_pic_url"\s*:\s*"([^"]+)"'):
+            m = re.search(pat, html_text)
+            if m:
+                url = html.unescape(m.group(1)).replace("\\u0026", "&").replace("\\/", "/")
+                _cache_set(cache_key, PicResp(url=url))
+                return url
+    except Exception as e:
+        print("HTML scrape profile_pic failed:", e)
+
     return None
 
 @app.get("/username/{username}/profile_pic", response_model=PicResp)
@@ -193,14 +236,33 @@ def profile_pic(username: str):
 
 @app.get("/username/{username}/profile-pic", response_model=PicResp)
 def profile_pic_dash(username: str):
-    url = _get_profile_pic(username)
-    if not url:
-        raise HTTPException(status_code=404, detail="not found")
-    return PicResp(url=url)
-# ===== Firebase =====
+    return profile_pic(username)
+
+# ===== 3) تحقق المتابعة =====
+@app.get("/verify_follow")
+def verify_follow(source: str = Query(...), target: str = Query(...)):
+    source = _normalize(source)
+    target = _normalize(target)
+
+    if not source or not target or len(source) > 30 or len(target) > 30:
+        return {"follows": False, "reason": "invalid"}
+
+    if not _ensure_login():
+        return {"follows": False, "reason": "login_failed"}
+
+    try:
+        src = instaloader.Profile.from_username(L.context, source)
+        for f in src.get_followees():
+            if f.username.lower() == target:
+                return {"follows": True, "reason": "ok"}
+        return {"follows": False, "reason": "not_following"}
+    except Exception as e:
+        print("verify_follow error:", e)
+        return {"follows": False, "reason": "error"}
+
+# ===== (اختياري) Firebase – غير مُستخدم هنا لكنه محفوظ كما كان =====
 FIREBASE_INITIALIZED = False
 db_admin = None
-
 def _init_firebase_once():
     global FIREBASE_INITIALIZED, db_admin
     if FIREBASE_INITIALIZED:
@@ -218,65 +280,3 @@ def _init_firebase_once():
     except Exception as e:
         print("Firebase init failed:", e)
         raise
-
-# ===== تحميل جلسة إنستغرام من ملف (أفضل من الباسورد) =====
-IG_SESSION_FILE = os.environ.get("IG_SESSION_FILE") or os.environ.get("SESSION_FILE")
-IG_SESSION_LOADED = False
-if HAS_INSTALOADER and IG_SESSION_FILE:
-    try:
-        L.load_session_from_file(None, IG_SESSION_FILE)
-        IG_SESSION_LOADED = True
-        print(f"[IG] Session loaded from {IG_SESSION_FILE}")
-    except Exception as e:
-        print(f"[IG] Failed to load session from file: {e}")
-
-# ===== تسجيل الدخول =====
-IG_LOGIN = os.getenv("IG_LOGIN")
-IG_PASSWORD = os.getenv("IG_PASSWORD")
-
-def _ensure_login():
-    """
-    يضمن أن L مسجّل دخول.
-    يحاول أولاً تحميل الجلسة، وإن لم ينجح يجرب IG_LOGIN/IG_PASSWORD.
-    """
-    global L, HAS_INSTALOADER, IG_SESSION_LOADED
-    if not HAS_INSTALOADER:
-        return False
-    if IG_SESSION_LOADED:
-        return True
-    if IG_LOGIN and IG_PASSWORD:
-        try:
-            L.login(IG_LOGIN, IG_PASSWORD)
-            IG_SESSION_LOADED = True
-            return True
-        except Exception as e:
-            print("Instaloader login failed:", e)
-    return False
-
-# ===== تحقق المتابعة =====
-class VerifyReq(BaseModel):
-    taskId: str
-    claimant: str
-    target: str
-
-class VerifyResp(BaseModel):
-    ok: bool
-    reason: Optional[str] = None
-    newCoins: Optional[int] = None
-
-@app.get("/verify_follow")
-def verify_follow(source: str = Query(...), target: str = Query(...)):
-    source = _normalize(source)
-    target = _normalize(target)
-    if not source or not target or len(source) > 30 or len(target) > 30:
-        return {"follows": False, "reason": "invalid"}
-    if not _ensure_login():
-        return {"follows": False, "reason": "login_failed"}
-    try:
-        src = instaloader.Profile.from_username(L.context, source)
-        for f in src.get_followees():
-            if f.username.lower() == target:
-                return {"follows": True, "reason": "ok"}
-        return {"follows": False, "reason": "not_following"}
-    except Exception:
-        return {"follows": False, "reason": "error"}
